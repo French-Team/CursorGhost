@@ -1,0 +1,1035 @@
+const express = require('express');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const cors = require('cors');
+const morgan = require('morgan');
+const bodyParser = require('body-parser');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const path = require('path');
+
+// Configuration
+const HTTP_PORT = 7778; // Port de secours si 443 n'est pas disponible
+const HTTPS_PORT = 443; // Port standard HTTPS
+const TARGET_URL = 'https://api2.cursor.sh';
+const MAX_LOGS = 500; // Augmenter le nombre maximal de logs à conserver (avant: 50)
+const VERBOSE_LOGGING = process.env.VERBOSE_LOGGING === 'true';
+// Définir une taille maximale approximative pour la sérialisation
+const MAX_SAFE_SERIALIZE_SIZE = 500000; // ~500Ko, ajustez selon vos besoins
+// Définir une taille maximale pour les chunks
+const MAX_CHUNK_SIZE = 400000; // ~400Ko, pour avoir une marge de sécurité
+
+// Initialiser l'application Express
+const app = express();
+
+// Middleware pour parser le corps des requêtes
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Activer CORS pour permettre les requêtes depuis l'application Next.js
+app.use(cors());
+
+// Stocker les logs des requêtes
+const requestLogs = [];
+const stats = {
+  incoming: 0,
+  outgoing: 0
+};
+
+// Middleware pour enregistrer les requêtes
+app.use(morgan((tokens, req, res) => {
+  // Créer l'objet de log
+  const log = {
+    timestamp: Date.now(),
+    method: tokens.method(req, res),
+    url: tokens.url(req, res),
+    status: parseInt(tokens.status(req, res) || 0),
+    size: tokens.res(req, res, 'content-length') || 0,
+    direction: 'outgoing',
+    // Ajouter le corps et les en-têtes de la requête sans limitation
+    body: req.body || {},
+    headers: req.headers || {}
+  };
+  
+  // Ajouter le log à la liste et limiter la taille
+  requestLogs.unshift(log);
+  if (requestLogs.length > MAX_LOGS) {
+    // Supprimer l'élément le plus ancien
+    // CORRECTION: Ne pas toucher aux statistiques quand on supprime des logs
+    requestLogs.pop();
+  }
+  
+  // Ne pas compter les requêtes internes au proxy (/logs, /stats, /reset)
+  if (log.url && 
+      !log.url.includes('/logs') && 
+      !log.url.includes('/stats') && 
+      !log.url.includes('/reset') &&
+      !log.url.includes('/simulation')) {
+    // Incrémenter les statistiques uniquement pour les requêtes API réelles
+    stats.outgoing++;
+  }
+  
+  // Ne retourner le log que si le mode verbeux est activé
+  return VERBOSE_LOGGING ? JSON.stringify(log) : null;
+}, {
+  // Désactiver l'affichage des logs dans la console
+  stream: {
+    write: (message) => {
+      // Ne rien faire si le message est null ou si le mode verbeux est désactivé
+      if (message && VERBOSE_LOGGING) {
+        console.log(`[PROXY] ${message.trim()}`);
+      }
+    }
+  }
+}));
+
+// Middleware pour intercepter les réponses
+app.use((req, res, next) => {
+  const originalSend = res.send;
+  
+  res.send = function(body) {
+    // Enregistrer la réponse
+    const log = {
+      timestamp: Date.now(),
+      method: 'RESPONSE',
+      url: req.originalUrl || req.url,
+      status: res.statusCode,
+      size: body ? body.length : 0,
+      direction: 'incoming',
+      // Ajouter le corps et les en-têtes de la réponse sans limitation
+      body: body,
+      headers: res.getHeaders ? res.getHeaders() : {}
+    };
+    
+    // Ajouter le log à la liste et limiter la taille
+    requestLogs.unshift(log);
+    if (requestLogs.length > MAX_LOGS) {
+      // Supprimer l'élément le plus ancien
+      // CORRECTION: Ne pas toucher aux statistiques quand on supprime des logs
+      requestLogs.pop();
+    }
+    
+    // Ne pas compter les requêtes internes au proxy (/logs, /stats, /reset)
+    if (log.url && 
+        !log.url.includes('/logs') && 
+        !log.url.includes('/stats') && 
+        !log.url.includes('/reset') &&
+        !log.url.includes('/simulation')) {
+      // Incrémenter les statistiques uniquement pour les requêtes API réelles
+      stats.incoming++;
+    }
+    
+    // Afficher le log dans la console si le mode verbeux est activé
+    if (VERBOSE_LOGGING) {
+      console.log(`[PROXY] ${log.method} ${log.url} (${log.status})`);
+    }
+    
+    // Appeler la méthode originale
+    return originalSend.call(this, body);
+  };
+  
+  next();
+});
+
+/**
+ * Estime la taille d'un objet JavaScript en octets
+ * @param {any} obj - L'objet à mesurer
+ * @returns {number} - La taille estimée en octets
+ */
+function estimateObjectSize(obj) {
+  try {
+    const json = JSON.stringify(obj);
+    return json.length * 2; // Approximation: 2 octets par caractère
+  } catch (error) {
+    console.error('[PROXY ERROR] Erreur lors de l\'estimation de la taille:', error);
+    // Estimation grossière basée sur le type
+    if (Array.isArray(obj)) {
+      return obj.length * 100; // Estimation approximative
+    } else if (typeof obj === 'object' && obj !== null) {
+      return Object.keys(obj).length * 200; // Estimation approximative
+    } else {
+      return 1000; // Valeur par défaut
+    }
+  }
+}
+
+/**
+ * Divise un objet en segments de taille acceptable pour la sérialisation
+ * @param {any} obj - L'objet à diviser
+ * @param {number} maxChunkSize - Taille maximale d'un segment en octets
+ * @returns {Array} - Tableau de segments
+ */
+function splitObjectIntoChunks(obj, maxChunkSize = MAX_CHUNK_SIZE) {
+  // Si l'objet est déjà assez petit, le retourner directement
+  const estimatedSize = estimateObjectSize(obj);
+  if (estimatedSize <= maxChunkSize) {
+    return [obj];
+  }
+  
+  console.log(`[PROXY] Objet trop volumineux (${estimatedSize} octets), division en segments...`);
+  
+  // Si c'est un tableau, le diviser en sous-tableaux
+  if (Array.isArray(obj)) {
+    return splitArrayIntoChunks(obj, maxChunkSize);
+  }
+  
+  // Si c'est un objet avec une propriété "logs", traiter spécialement cette propriété
+  if (obj && typeof obj === 'object' && Array.isArray(obj.logs)) {
+    // Créer des chunks pour les logs tout en conservant les métadonnées
+    const { logs, ...metadata } = obj;
+    const logChunks = splitArrayIntoChunks(logs, maxChunkSize);
+    
+    // Retourner chaque segment avec les métadonnées
+    return logChunks.map((logChunk, index) => ({
+      ...metadata,
+      logs: logChunk,
+      _chunkInfo: {
+        index,
+        total: logChunks.length,
+        isLastChunk: index === logChunks.length - 1
+      }
+    }));
+  }
+  
+  // Cas par défaut: impossible de diviser l'objet
+  console.warn('[PROXY WARNING] Impossible de diviser l\'objet en segments');
+  return [obj];
+}
+
+/**
+ * Divise un tableau en segments de taille acceptable
+ * @param {Array} array - Le tableau à diviser
+ * @param {number} maxChunkSize - Taille maximale d'un segment en octets
+ * @returns {Array} - Tableau de segments
+ */
+function splitArrayIntoChunks(array, maxChunkSize) {
+  const chunks = [];
+  let currentChunk = [];
+  let currentSize = 0;
+  
+  // Parcourir chaque élément du tableau
+  for (const item of array) {
+    const itemSize = estimateObjectSize(item);
+    
+    // Si l'élément seul est trop grand, l'inclure quand même
+    // mais créer un nouveau segment après
+    if (itemSize > maxChunkSize) {
+      if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentSize = 0;
+      }
+      chunks.push([item]);
+      continue;
+    }
+    
+    // Si ajouter cet élément dépasse la taille maximale,
+    // commencer un nouveau segment
+    if (currentSize + itemSize > maxChunkSize) {
+      chunks.push(currentChunk);
+      currentChunk = [item];
+      currentSize = itemSize;
+    } else {
+      // Sinon, ajouter l'élément au segment actuel
+      currentChunk.push(item);
+      currentSize += itemSize;
+    }
+  }
+  
+  // Ne pas oublier le dernier segment
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+  
+  console.log(`[PROXY] Tableau divisé en ${chunks.length} segments`);
+  return chunks;
+}
+
+/**
+ * Composant pour gérer la sérialisation et l'envoi des objets volumineux
+ */
+const ChunkManager = {
+  /**
+   * Tente de sérialiser et d'envoyer un objet, le divise en segments si nécessaire
+   * @param {Response} res - L'objet de réponse Express
+   * @param {any} obj - L'objet à envoyer
+   * @param {number} chunkIndex - Index du segment à envoyer (0 par défaut)
+   */
+  sendChunkedResponse: function(res, obj, chunkIndex = 0) {
+    try {
+      // Estimer la taille de l'objet
+      const estimatedSize = estimateObjectSize(obj);
+      
+      // Si l'objet est trop grand, le diviser en segments
+      if (estimatedSize > MAX_SAFE_SERIALIZE_SIZE) {
+        console.log(`[PROXY] Objet trop volumineux (${estimatedSize} octets), segmentation en cours...`);
+        const chunks = splitObjectIntoChunks(obj);
+        
+        if (chunks.length === 1) {
+          // Si un seul segment, essayer de l'envoyer directement
+          console.log('[PROXY] Un seul segment généré, tentative d\'envoi direct...');
+          try {
+            // Vérifier si la sérialisation fonctionne
+            JSON.stringify(chunks[0]);
+            res.json(chunks[0]);
+            return;
+          } catch (error) {
+            console.error('[PROXY ERROR] Échec de la sérialisation directe:', error);
+            res.status(500).json({
+              error: "Données trop volumineuses pour être affichées",
+              suggestion: "Utilisez la pagination ou filtrez les résultats"
+            });
+            return;
+          }
+        }
+        
+        // S'il y a plusieurs segments, envoyer celui demandé
+        if (chunkIndex < chunks.length) {
+          console.log(`[PROXY] Envoi du segment ${chunkIndex + 1}/${chunks.length}`);
+          res.json(chunks[chunkIndex]);
+        } else {
+          res.status(404).json({
+            error: "Segment non trouvé",
+            suggestion: "Vérifiez l'index du segment"
+          });
+        }
+      } else {
+        // Si l'objet est assez petit, l'envoyer directement
+        res.json(obj);
+      }
+    } catch (error) {
+      console.error('[PROXY ERROR] Erreur lors de l\'envoi segmenté:', error);
+      res.status(500).json({
+        error: "Erreur lors de la sérialisation des données",
+        message: error.message
+      });
+    }
+  }
+};
+
+// Endpoint pour récupérer les logs
+app.get('/logs', (req, res) => {
+  // Si aucun log n'existe, générer des données de test
+  if (requestLogs.length === 0) {
+    generateTestData();
+  }
+  
+  if (requestLogs.length > 0) {
+    const outgoingCount = requestLogs.filter(log => log.direction === 'outgoing').length;
+    const incomingCount = requestLogs.filter(log => log.direction === 'incoming').length;
+    console.log(`  Sortants: ${outgoingCount}, Entrants: ${incomingCount}`);
+    console.log(`  Premier log: ${requestLogs[0].method} ${requestLogs[0].url.substring(0, 30)}... (${requestLogs[0].direction})`);
+  }
+  
+  // Gestion de la pagination
+  const limit = parseInt(req.query.limit) || 10; // Défaut de 10 logs
+  const offset = parseInt(req.query.offset) || 0;
+  
+  // Option pour inclure ou non les corps dans la réponse
+  const includeBodies = req.query.bodies !== 'false';
+  
+  // Nouvelle option pour filtrer par direction (incoming/outgoing)
+  const directionFilter = req.query.direction;
+  
+  // Nouveau paramètre pour spécifier l'index du segment
+  const chunkIndex = parseInt(req.query.chunk) || 0;
+  
+  try {
+    // Filtrer les logs si nécessaire
+    let filteredLogs = [...requestLogs];
+    
+    if (directionFilter) {
+      filteredLogs = filteredLogs.filter(log => log.direction === directionFilter);
+    }
+    
+    // Préparer les logs avec la pagination
+    const paginatedLogs = filteredLogs
+      .slice(offset, offset + limit)
+      .map(log => {
+        // Créer une copie pour ne pas modifier les logs originaux
+        const processedLog = { 
+          timestamp: log.timestamp,
+          method: log.method,
+          url: log.url,
+          status: log.status,
+          direction: log.direction,
+          size: log.size
+        };
+        
+        // Inclure les corps complets si demandé
+        if (includeBodies) {
+          if (log.body) {
+            processedLog.body = log.body;
+          }
+          
+          // Inclure tous les en-têtes
+          if (log.headers) {
+            processedLog.headers = log.headers;
+          }
+        } else {
+          // Indiquer que les corps ont été omis intentionnellement
+          processedLog.bodyOmitted = true;
+          processedLog.headersOmitted = true;
+        }
+        
+        return processedLog;
+      });
+    
+    // Préparer l'objet de réponse complet
+    const responseObject = {
+      total: filteredLogs.length,
+      offset: offset,
+      limit: limit,
+      outgoingCount: requestLogs.filter(log => log.direction === 'outgoing').length,
+      incomingCount: requestLogs.filter(log => log.direction === 'incoming').length,
+      logs: paginatedLogs
+    };
+    
+    // Utiliser notre gestionnaire de segments pour envoyer la réponse
+    ChunkManager.sendChunkedResponse(res, responseObject, chunkIndex);
+  } catch (error) {
+    console.error('[PROXY ERROR] Erreur lors de l\'envoi des logs:', error);
+    res.status(500).json({
+      error: 'Erreur lors de la récupération des logs',
+      message: error.message
+    });
+  }
+});
+
+// Endpoint pour récupérer les statistiques
+app.get('/stats', (req, res) => {
+  // Si aucune statistique n'existe, générer des données de test
+  if (stats.incoming === 0 && stats.outgoing === 0) {
+    generateTestData();
+  }
+  res.json(stats);
+});
+
+// Endpoint pour réinitialiser les logs et les statistiques
+app.get('/reset', (req, res) => {
+  if (VERBOSE_LOGGING) {
+    console.log("Réinitialisation des logs et statistiques...");
+  }
+  
+  // Vider les logs
+  requestLogs.length = 0;
+  
+  // Réinitialiser les statistiques
+  stats.incoming = 0;
+  stats.outgoing = 0;
+  
+  // Générer quelques données initiales
+  generateTestData();
+  
+  // Renvoyer les nouvelles statistiques
+  res.json({
+    message: "Logs et statistiques réinitialisés avec succès",
+    stats: stats
+  });
+});
+
+// Fonction pour générer des données de test
+function generateTestData() {
+  console.log("Génération de données de test...");
+  
+  // Vider les logs existants si nécessaire
+  if (requestLogs.length > 0) {
+    requestLogs.length = 0;
+  }
+  
+  // Réinitialiser les statistiques si nécessaire
+  if (stats.incoming > 0 || stats.outgoing > 0) {
+    stats.incoming = 0;
+    stats.outgoing = 0;
+  }
+  
+  // Générer quelques requêtes fictives
+  const methods = ['GET', 'POST', 'PUT', 'DELETE'];
+  const apiPaths = [
+    '/api/v1/completions',
+    '/api/v1/chat/completions',
+    '/api/v1/models',
+    '/api/v1/user/settings',
+    '/api/v1/workspace/sync'
+  ];
+  const statuses = [200, 201, 400, 404, 500];
+  
+  // Timestamp de base pour toutes les requêtes (maintenant)
+  const baseTimestamp = Date.now();
+  
+  // Générer 5 paires de requêtes (sortante puis entrante)
+  for (let i = 0; i < 5; i++) {
+    const method = methods[Math.floor(Math.random() * methods.length)];
+    const apiPath = apiPaths[Math.floor(Math.random() * apiPaths.length)];
+    const status = statuses[Math.floor(Math.random() * statuses.length)];
+    const size = Math.floor(Math.random() * 10000);
+    
+    // La même URL est utilisée pour les requêtes sortantes et entrantes
+    // car il s'agit du même endpoint
+    const urlWithHost = `https://api2.cursor.sh${apiPath}`;
+    
+    // Générer un corps de requête en fonction du chemin de l'API
+    let requestBody = {};
+    if (apiPath.includes('completions')) {
+      requestBody = {
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: 'You are a helpful assistant.' },
+          { role: 'user', content: 'Comment puis-je utiliser CursorProxy?' }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7
+      };
+    } else if (apiPath.includes('settings')) {
+      requestBody = {
+        autoComplete: true,
+        theme: 'dark',
+        fontSize: 14,
+        indentSize: 2,
+        showLineNumbers: true
+      };
+    }
+    
+    // Générer un corps de réponse en fonction du chemin de l'API et du statut
+    let responseBody = {};
+    if (status >= 400) {
+      responseBody = {
+        error: {
+          message: `Une erreur s'est produite avec le code ${status}`,
+          type: status >= 500 ? 'server_error' : 'client_error',
+          code: `ERR_${status}`,
+          param: null,
+          details: 'Plus de détails sur l\'erreur ici'
+        }
+      };
+    } else if (apiPath.includes('completions')) {
+      responseBody = {
+        id: 'chatcmpl-' + Math.random().toString(36).substring(2, 15),
+        object: 'chat.completion',
+        created: Date.now(),
+        model: 'gpt-4',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'Pour utiliser CursorProxy, voici les étapes:\n\n1. Clonez le dépôt GitHub\n2. Installez les dépendances avec `npm install`\n3. Lancez le serveur proxy avec `npm run proxy`\n4. Configurez Cursor pour utiliser le proxy local\n5. Profitez de la visibilité sur les communications!'
+            },
+            finish_reason: 'stop',
+            index: 0
+          }
+        ],
+        usage: {
+          prompt_tokens: 52,
+          completion_tokens: 89,
+          total_tokens: 141
+        }
+      };
+    } else if (apiPath.includes('models')) {
+      responseBody = {
+        data: [
+          { id: 'gpt-4', name: 'GPT-4', description: 'Le plus avancé', created: Date.now() - 10000000 },
+          { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', description: 'Rapide et efficace', created: Date.now() - 20000000 },
+          { id: 'claude-3', name: 'Claude 3', description: 'Alternative performante', created: Date.now() - 5000000 }
+        ]
+      };
+    }
+    
+    // Générer des en-têtes pour les requêtes et réponses
+    const requestHeaders = {
+      'content-type': 'application/json',
+      'user-agent': 'CursorProxy/1.0',
+      'authorization': 'Bearer token123'
+    };
+    
+    const responseHeaders = {
+      'content-type': 'application/json',
+      'content-length': (size * 2).toString(),
+      'server': 'CursorServer/1.0'
+    };
+    
+    // Requête sortante - du client vers l'API
+    const outgoingLog = {
+      timestamp: baseTimestamp - (i * 10000), // Plus récent pour i=0
+      method: method,
+      url: urlWithHost, // URL complète
+      status: status,
+      size: size.toString(),
+      direction: 'outgoing', // Direction, pas URL
+      body: requestBody,
+      headers: requestHeaders
+    };
+    
+    // Requête entrante (réponse) - de l'API vers le client
+    const incomingLog = {
+      timestamp: baseTimestamp - (i * 10000) + 500, // 500ms après la requête sortante
+      method: 'RESPONSE',
+      url: urlWithHost, // Même URL car même ressource
+      status: status,
+      size: (size * 2).toString(),
+      direction: 'incoming', // Direction, pas URL
+      body: responseBody,
+      headers: responseHeaders
+    };
+    
+    // Ajouter les logs dans l'ordre chronologique (plus récent en premier)
+    requestLogs.push(outgoingLog);
+    requestLogs.push(incomingLog);
+  }
+  
+  // Trier les logs par timestamp pour assurer l'ordre correct (plus récent d'abord)
+  requestLogs.sort((a, b) => b.timestamp - a.timestamp);
+  
+  // Limiter la taille des logs
+  while (requestLogs.length > MAX_LOGS) {
+    const removedLog = requestLogs.pop();
+    // CORRECTION: Ne pas décrémenter les compteurs stats quand on supprime des logs
+    // La suppression des logs ne doit pas affecter les compteurs
+    // if (removedLog.direction === 'incoming') stats.incoming--;
+    // else stats.outgoing--;
+  }
+  
+  console.log("Données de test générées:", requestLogs.length, "logs");
+  console.log("Distribution:", 
+    requestLogs.filter(log => log.direction === 'outgoing').length, "sortants,",
+    requestLogs.filter(log => log.direction === 'incoming').length, "entrants"
+  );
+  
+  // Afficher les 4 premiers logs pour vérification
+  console.log("Premiers logs:");
+  requestLogs.slice(0, 4).forEach((log, index) => {
+    console.log(`  ${index}: ${log.method} ${log.url} (${log.direction})`);
+  });
+}
+
+// Fonction pour générer périodiquement des requêtes simulées Cursor
+function generateCursorRequests() {
+  console.log("Démarrage de la génération de requêtes Cursor simulées...");
+  
+  // Endpoints Cursor typiques
+  const apiPaths = [
+    '/api/v1/completions',
+    '/api/v1/chat/completions',
+    '/api/v1/models',
+    '/api/v1/user/settings',
+    '/api/v1/workspace/sync'
+  ];
+  
+  // Méthodes HTTP
+  const methods = ['GET', 'POST', 'PUT'];
+  
+  // Génération d'une requête toutes les 5 secondes
+  setInterval(() => {
+    // Sélectionner aléatoirement une méthode et une URL
+    const method = methods[Math.floor(Math.random() * methods.length)];
+    const apiPath = apiPaths[Math.floor(Math.random() * apiPaths.length)];
+    const urlWithHost = `https://api2.cursor.sh${apiPath}`;
+    const size = Math.floor(Math.random() * 5000);
+    const status = Math.random() > 0.9 ? 500 : 200; // 10% de chance d'erreur
+    
+    // Générer un corps de requête en fonction du chemin de l'API
+    let requestBody = {};
+    if (apiPath.includes('completions')) {
+      requestBody = {
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: 'You are a helpful assistant.' },
+          { role: 'user', content: 'Comment puis-je utiliser CursorProxy?' }
+        ],
+        max_tokens: 1000,
+        temperature: 0.7
+      };
+    } else if (apiPath.includes('settings')) {
+      requestBody = {
+        autoComplete: true,
+        theme: 'dark',
+        fontSize: 14,
+        indentSize: 2,
+        showLineNumbers: true
+      };
+    }
+    
+    // Générer des en-têtes pour la requête
+    const requestHeaders = {
+      'content-type': 'application/json',
+      'user-agent': 'CursorProxy/1.0',
+      'authorization': 'Bearer token123'
+    };
+    
+    // Créer un log de requête sortante
+    const outgoingLog = {
+      timestamp: Date.now(),
+      method: method,
+      url: urlWithHost,
+      status: status,
+      size: size.toString(),
+      direction: 'outgoing',
+      body: requestBody,
+      headers: requestHeaders
+    };
+    
+    // Ajouter la requête sortante
+    requestLogs.unshift(outgoingLog);
+    stats.outgoing++;
+    
+    console.log(`Requête sortante générée: ${method} ${urlWithHost} (direction: outgoing)`);
+    
+    // Simuler une réponse après un court délai
+    setTimeout(() => {
+      // Générer un corps de réponse en fonction du chemin de l'API et du statut
+      let responseBody = {};
+      if (status >= 400) {
+        responseBody = {
+          error: {
+            message: `Une erreur s'est produite avec le code ${status}`,
+            type: status >= 500 ? 'server_error' : 'client_error',
+            code: `ERR_${status}`,
+            param: null,
+            details: 'Plus de détails sur l\'erreur ici'
+          }
+        };
+      } else if (apiPath.includes('completions')) {
+        responseBody = {
+          id: 'chatcmpl-' + Math.random().toString(36).substring(2, 15),
+          object: 'chat.completion',
+          created: Date.now(),
+          model: 'gpt-4',
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: 'Pour utiliser CursorProxy, voici les étapes:\n\n1. Clonez le dépôt GitHub\n2. Installez les dépendances avec `npm install`\n3. Lancez le serveur proxy avec `npm run proxy`\n4. Configurez Cursor pour utiliser le proxy local\n5. Profitez de la visibilité sur les communications!'
+              },
+              finish_reason: 'stop',
+              index: 0
+            }
+          ],
+          usage: {
+            prompt_tokens: 52,
+            completion_tokens: 89,
+            total_tokens: 141
+          }
+        };
+      } else if (apiPath.includes('models')) {
+        responseBody = {
+          data: [
+            { id: 'gpt-4', name: 'GPT-4', description: 'Le plus avancé', created: Date.now() - 10000000 },
+            { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', description: 'Rapide et efficace', created: Date.now() - 20000000 },
+            { id: 'claude-3', name: 'Claude 3', description: 'Alternative performante', created: Date.now() - 5000000 }
+          ]
+        };
+      }
+      
+      // Générer des en-têtes pour la réponse
+      const responseHeaders = {
+        'content-type': 'application/json',
+        'content-length': (size * 2).toString(),
+        'server': 'CursorServer/1.0'
+      };
+      
+      const incomingLog = {
+        timestamp: Date.now(),
+        method: 'RESPONSE',
+        url: urlWithHost, // Même URL que la requête sortante
+        status: status,
+        size: (size * 1.5).toString(),
+        direction: 'incoming',
+        body: responseBody,
+        headers: responseHeaders
+      };
+      
+      // Ajouter la réponse (requête entrante)
+      requestLogs.unshift(incomingLog);
+      stats.incoming++;
+      
+      console.log(`Réponse entrante générée: RESPONSE ${urlWithHost} (direction: incoming)`);
+      
+      // Trier les logs par timestamp (plus récent en premier)
+      requestLogs.sort((a, b) => b.timestamp - a.timestamp);
+      
+      // Limiter la taille des logs
+      while (requestLogs.length > MAX_LOGS) {
+        const removedLog = requestLogs.pop();
+        // CORRECTION: Ne pas décrémenter les compteurs stats quand on supprime des logs
+        // La suppression des logs ne doit pas affecter les compteurs
+        // if (removedLog.direction === 'incoming') stats.incoming--;
+        // else stats.outgoing--;
+      }
+      
+      // Afficher l'état actuel des logs pour débogage
+      console.log(`Nombre total de logs: ${requestLogs.length} (${requestLogs.filter(log => log.direction === 'outgoing').length} sortants)`);
+      if (requestLogs.length > 0) {
+        console.log("Premiers logs après ajout:");
+        requestLogs.slice(0, 2).forEach((log, index) => {
+          console.log(`  ${index}: ${log.method} ${log.url} (${log.direction})`);
+        });
+      }
+    }, 500);
+  }, 5000);
+}
+
+// Démarrer la génération de requêtes simulées
+const simulationInterval = generateCursorRequests();
+
+// Ajouter un endpoint pour arrêter/démarrer la simulation
+app.get('/simulation/toggle', (req, res) => {
+  if (simulationInterval) {
+    clearInterval(simulationInterval);
+    res.json({ status: 'simulation_stopped' });
+  } else {
+    simulationInterval = generateCursorRequests();
+    res.json({ status: 'simulation_started' });
+  }
+});
+
+// Endpoint pour simuler un échange avec Claude
+app.get('/simulation/claude', (req, res) => {
+  console.log("Génération d'une simulation d'échange avec Claude...");
+  
+  // Simuler une requête client vers Claude
+  const clientRequestTimestamp = Date.now();
+  const clientRequest = {
+    timestamp: clientRequestTimestamp,
+    method: 'POST',
+    url: 'https://anthropic.com/claude-api/completions',
+    status: 0, // Pas encore de statut
+    size: '1024',
+    direction: 'outgoing',
+    body: {
+      model: "claude-3-sonnet-20240229",
+      messages: [
+        { role: "user", content: "Comment puis-je utiliser ce proxy pour voir nos échanges?" }
+      ],
+      max_tokens: 1000
+    },
+    headers: {
+      'content-type': 'application/json',
+      'authorization': 'Bearer sk-simu-xxxxx',
+      'accept': 'application/json'
+    }
+  };
+  
+  // Ajouter la requête aux logs
+  requestLogs.unshift(clientRequest);
+  stats.outgoing++;
+  
+  // Simuler une réponse de Claude après un court délai
+  setTimeout(() => {
+    const claudeResponse = {
+      timestamp: clientRequestTimestamp + 1200, // 1.2 secondes plus tard
+      method: 'RESPONSE',
+      url: 'https://anthropic.com/claude-api/completions',
+      status: 200,
+      size: '2048',
+      direction: 'incoming',
+      body: {
+        id: "msg_simu123456789",
+        model: "claude-3-sonnet-20240229",
+        type: "message",
+        content: [
+          {
+            type: "text",
+            text: "Pour voir nos échanges dans le proxy, suivez ces étapes:\n\n1. Assurez-vous que le serveur proxy est en cours d'exécution avec 'npm run proxy'\n2. Effectuez des requêtes à travers ce proxy\n3. Consultez l'interface du RequestContentSection pour voir les requêtes et réponses\n\nLes échanges devraient apparaître dans les sections 'Requête Client' et 'Réponse Serveur' de l'interface. Si vous ne les voyez pas, vérifiez que le filtre dans RequestContentSection.js inclut les URLs pertinentes."
+          }
+        ],
+        usage: {
+          input_tokens: 15,
+          output_tokens: 87
+        }
+      },
+      headers: {
+        'content-type': 'application/json',
+        'content-length': '2048'
+      }
+    };
+    
+    // Ajouter la réponse aux logs
+    requestLogs.unshift(claudeResponse);
+    stats.incoming++;
+    
+    console.log("Simulation d'échange avec Claude terminée");
+  }, 1000);
+  
+  // Renvoyer un message de confirmation
+  res.json({
+    message: "Simulation d'échange avec Claude démarrée",
+    note: "Rafraîchissez l'interface pour voir les nouveaux échanges"
+  });
+});
+
+// Créer le proxy pour rediriger les requêtes vers api2.cursor.sh
+const apiProxy = createProxyMiddleware({
+  target: TARGET_URL,
+  changeOrigin: true,
+  pathRewrite: {
+    '^/api': '/api' // Conserver le chemin /api
+  },
+  onProxyRes: (proxyRes, req, res) => {
+    // Enregistrer la réponse du proxy
+    console.log(`Réponse du proxy: ${proxyRes.statusCode}`);
+  }
+});
+
+// Appliquer le proxy à toutes les requêtes commençant par /api
+app.use('/api', apiProxy);
+
+// Route par défaut
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>Cursor Proxy Server</title>
+        <style>
+          body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+          h1 { color: #0070f3; }
+          .endpoint { background: #f0f0f0; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+          code { background: #e0e0e0; padding: 2px 5px; border-radius: 3px; }
+        </style>
+      </head>
+      <body>
+        <h1>Cursor Proxy Server</h1>
+        <p>Ce serveur intercepte les communications avec api2.cursor.sh et fournit des API pour visualiser les requêtes.</p>
+        
+        <h2>Endpoints disponibles:</h2>
+        <div class="endpoint">
+          <h3>GET /logs</h3>
+          <p>Récupère la liste des dernières requêtes interceptées.</p>
+          <p>Exemple: <a href="/logs" target="_blank">/logs</a></p>
+        </div>
+        
+        <div class="endpoint">
+          <h3>GET /stats</h3>
+          <p>Récupère les statistiques des requêtes (nombre de requêtes entrantes et sortantes).</p>
+          <p>Exemple: <a href="/stats" target="_blank">/stats</a></p>
+        </div>
+        
+        <h2>Configuration:</h2>
+        <ul>
+          <li>Port HTTP: <code>${HTTP_PORT}</code></li>
+          <li>Port HTTPS: <code>${HTTPS_PORT}</code></li>
+          <li>URL cible: <code>${TARGET_URL}</code></li>
+          <li>Nombre maximum de logs: <code>${MAX_LOGS}</code></li>
+        </ul>
+        
+        <p>Pour utiliser ce proxy avec Cursor, configurez votre application pour envoyer les requêtes à <code>http://localhost:${HTTP_PORT}</code> ou <code>https://api2.cursor.sh</code> (si le fichier hosts est configuré).</p>
+      </body>
+    </html>
+  `);
+});
+
+// Générer des certificats auto-signés si nécessaire
+const certPath = path.join(__dirname, 'cert');
+const keyPath = path.join(__dirname, 'cert', 'key.pem');
+const certFilePath = path.join(__dirname, 'cert', 'cert.pem');
+
+// Créer le dossier cert s'il n'existe pas
+if (!fs.existsSync(certPath)) {
+  fs.mkdirSync(certPath, { recursive: true });
+}
+
+// Vérifier si les certificats existent
+let httpsOptions;
+try {
+  if (fs.existsSync(keyPath) && fs.existsSync(certFilePath)) {
+    httpsOptions = {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certFilePath)
+    };
+    console.log('Certificats SSL trouvés.');
+  } else {
+    console.log('Certificats SSL non trouvés. Création de certificats auto-signés...');
+    
+    // Utiliser un certificat auto-signé par défaut
+    // Note: Ceci est pour la démonstration uniquement, ne pas utiliser en production
+    httpsOptions = {
+      key: `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDEJ0iI5jIKlIpF
+JQXDJQiG0hEVwMRHJcuJJPsXpRDPeA3o0NdRJxCnIzcvP5rjBmIUFaQGGhzH/Wlq
+0DXcJEb+Eik5O+NkfLLG/YQjS7Hnj7K6S+FzFgvjHMrFJKUWHp+LoGnL4SNA1Zxr
+0H7TcvXV/dIzRRwj7svxHKKXQgkKrOBFxPfFM7fTJEhBGjnDCwxCYgXEDwgLjSz+
+rY/xDQYsC8VD0xLEIiSKcKQVtfMYe3xsZQVXfOA9YkwDx1/Tz8nQlkGWDQEYlcJl
+Hb6SXv9CKiMbKbZFcpNQP5S8QMvJ5Z9HQAFDl/htQIQJE0+/KXQxJqJGBGnvvneG
+iqFdJJYnAgMBAAECggEAVnzCjvXWYPXcCWz0ueqHEoQQgz2tUYSJQoGCF4XQNRHC
+0Nnxs1kFcG/X1G9zLXBkrYXtBYhQjFGKjH5jUzJJ5ZeLHvdwL/RzCLLnZM/IKxCy
+QeZUQEL5OwYWOEBQnxYQZYI3AKRmDlUYbLQaXYJpkCHnHFdTKFqJgRUYfpGKIcsg
+Fy8s8jZZXSsGnYNxgDyQZYP0LPr54UdQXsQK9HRXK8N6cHmfSeXQNP2zHzIGj5JD
+KeGFDjHtJ+4xZJL5SAAm4j9aJFCXFz+y7qOyXO/9G6yiJPGEoE8/yHgHwwSZ1VJm
+HlRVSQRNL+LvIKRIJJLbwLiOWIV6rGZCYjbwKxGYAQKBgQDxvBFrHZ7gRqfx9Xnp
+8TVrMZbv8fUj9ZJXJkgXz0tKFYPyRKw9Pf4+iN2qQQ7QJQEiK8AQFkqvpsKMgMJ1
+JKEGGbTHwEJ7LZui1Ck7H6J9/RARejYHwFtCr6YzVVAxrKG/K8BpSEPEvKYdYA1I
+mW+dPGGKIWAYPOKl5D5qGaKmAQKBgQDPzxS9fx6K+TNUZ3qPm1+pPDNKGXtOEUwK
+YZRBVnKWpCJq/xvkKYIXogY7jTYj6xzJaoUdCmJGQVxVEXbZJCYnLLXJcG/gCmjH
+BPPEpNYj5VC+18En3CaFHZ0n8PpQMJxJ2PZECr7/PmCJG/ufJOG/RYy5HFPvdV0o
+BI2Iy9/BJwKBgQCLYQOLJQ0GXV8fzGQzWHMxLxAYCJnQZvYwBSHZ8VdhzhwXs1JG
+nkJdh7/LqyhMZR3pKJU4Jt9XDY7mtUXDKV+YiuJTZjUsXKx1KJVjXGxIUQaXVUAZ
+8XJoHUCpxbHKT1LJWIEfZ+uIlbQYpjQZTQMrJvPLx+QdKx/Vxg4+KA0BAQKBgHGe
+MDCnDuq+3EL4AEpgYq35MTY41D0Z7AOOgEIuqUhIvJJJYJW5Q8NhNOvGQcOVU1FU
+JlQVWnXrIjmtOUbcjrRzS0YyJlgCXZUEUPCvHYMR/RfKgSNgXfOEpP/uYyKoZ5XJ
+Y4D8+oPRFTzh/7yNS5yHnVyQEJc8XJR9mIYYvQYRAoGAQGFLLuErYKfPCgVQJ1iw
+tFjQIkK5sBYlJ9KXUJxiUDXcSPJgYZCvtXDz4K6QCUz7UlxLCQwGnKmk8HoLQUX8
+Gqm/BHgRn+K2l+UlBTKFKgAQqLVDScJcBgUGGvLGF4dTUZHdyO/zGYK3RQyflTSU
+K6+5qqJf4rDUTUTqhiY+yfQ=
+-----END PRIVATE KEY-----`,
+      cert: `-----BEGIN CERTIFICATE-----
+MIIDazCCAlOgAwIBAgIUEQpXHj7hVXIFQJBPJ6F/DZWcL9AwDQYJKoZIhvcNAQEL
+BQAwRTELMAkGA1UEBhMCQVUxEzARBgNVBAgMClNvbWUtU3RhdGUxITAfBgNVBAoM
+GEludGVybmV0IFdpZGdpdHMgUHR5IEx0ZDAeFw0yMzA3MTUxNDI3MzhaFw0zMzA3
+MTIxNDI3MzhaMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEw
+HwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQDEJ0iI5jIKlIpFJQXDJQiG0hEVwMRHJcuJJPsXpRDP
+eA3o0NdRJxCnIzcvP5rjBmIUFaQGGhzH/Wlq0DXcJEb+Eik5O+NkfLLG/YQjS7Hn
+j7K6S+FzFgvjHMrFJKUWHp+LoGnL4SNA1Zxr0H7TcvXV/dIzRRwj7svxHKKXQgkK
+rOBFxPfFM7fTJEhBGjnDCwxCYgXEDwgLjSz+rY/xDQYsC8VD0xLEIiSKcKQVtfMY
+e3xsZQVXfOA9YkwDx1/Tz8nQlkGWDQEYlcJlHb6SXv9CKiMbKbZFcpNQP5S8QMvJ
+5Z9HQAFDl/htQIQJE0+/KXQxJqJGBGnvvneGiqFdJJYnAgMBAAGjUzBRMB0GA1Ud
+DgQWBBQHWYFTBsEYJXF8VSKRhJIwtVagLjAfBgNVHSMEGDAWgBQHWYFTBsEYJXF8
+VSKRhJIwtVagLjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQB5
+5+EOq5AcLfBjIJzxL+PyN7DjQ5Ogq9NyBuQYQhMWIkQfGgQxG4sVlRrDQYZ8JiR3
+kjpyHbNIrDUUBMESz+CYjIyaIZn9GP5RjKcN/cSTwOQG3SwH8QVvBJMQEVgnpuZ9
+D2+/G0vqKhFJdL8NqtFmZpyX8IrCCrQSzLXJFHQOi/XQtmRdDLRVn+narOZcZnKR
+PHx4CNAYCsi3JpZfJlPn+0Wj5nxQQOH+MoC5/WVz/TfRnFX5LKlZVeBJTf7vnwH9
+v/jKLFKP8kPVkOoIoR0I5XLRpnOQJRwRlnvjUQTUyTNEApuLI9Bv869ULcU3+1+K
+J+/s7JFHhxMGkUVs8KHV
+-----END CERTIFICATE-----`
+    };
+    
+    // Écrire les certificats dans des fichiers pour une utilisation future
+    fs.writeFileSync(keyPath, httpsOptions.key);
+    fs.writeFileSync(certFilePath, httpsOptions.cert);
+    console.log('Certificats auto-signés créés et enregistrés.');
+  }
+} catch (error) {
+  console.error('Erreur lors de la gestion des certificats SSL:', error);
+  httpsOptions = null;
+}
+
+// Créer les serveurs HTTP et HTTPS
+const httpServer = http.createServer(app);
+
+// Démarrer le serveur HTTP sur le port de secours
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`Serveur proxy démarré sur http://localhost:${HTTP_PORT}`);
+});
+
+// Démarrer le serveur HTTPS sur le port 443 si les certificats sont disponibles
+if (httpsOptions) {
+  try {
+    const httpsServer = https.createServer(httpsOptions, app);
+    httpsServer.listen(HTTPS_PORT, () => {
+      if (VERBOSE_LOGGING) {
+        console.log(`Serveur HTTPS démarré sur https://localhost:${HTTPS_PORT}`);
+        console.log(`Redirection des requêtes vers ${TARGET_URL}`);
+      }
+    });
+  } catch (error) {
+    console.error(`Erreur lors du démarrage du serveur HTTPS sur le port ${HTTPS_PORT}:`, error);
+    console.log(`Le port ${HTTPS_PORT} nécessite des privilèges administrateur. Exécutez le script en tant qu'administrateur.`);
+    console.log(`Vous pouvez toujours utiliser le serveur HTTP sur le port ${HTTP_PORT}.`);
+  }
+} else {
+  console.log(`Impossible de démarrer le serveur HTTPS. Utilisez le serveur HTTP sur le port ${HTTP_PORT}.`);
+}
+
+if (VERBOSE_LOGGING) {
+  console.log(`[HPM] Proxy created: /  -> ${TARGET_URL}`);
+  console.log(`[HPM] Proxy rewrite rule created: "^/api" ~> "/api"`);
+} 

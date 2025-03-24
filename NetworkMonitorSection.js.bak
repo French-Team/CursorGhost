@@ -1,0 +1,70 @@
+'use client';
+
+import React, { useState, useEffect } from 'react';
+import ClientOnly from '../components/ClientOnly';
+
+export default function NetworkMonitorSection() {
+    const [icons, setIcons] = useState({ FiTerminal: null });
+    const [logs, setLogs] = useState([]);
+
+    useEffect(() => {
+        const loadIcons = async () => {
+            try {
+                const { FiTerminal } = await import('react-icons/fi');
+                setIcons({ FiTerminal });
+            } catch (error) {
+                console.error("Erreur lors du chargement des icônes:", error);
+            }
+        };
+        loadIcons();
+
+        const ws = new WebSocket('ws://localhost:7777');
+
+        ws.onmessage = (event) => {
+            const logEntry = JSON.parse(event.data);
+            setLogs(prev => [
+                `[${new Date().toLocaleTimeString()}] ${logEntry.method} ${logEntry.path} - ${logEntry.status}`,
+                ...prev
+            ].slice(0, 20));
+        };
+
+        ws.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            setLogs(prev => [`[${new Date().toLocaleTimeString()}] Connection error - ${error.message}`, ...prev]);
+        };
+
+        return () => ws.close();
+    }, []);
+
+    return (
+        <section id="network-monitor" className="section bg-dark-light">
+            <div className="container">
+                <ClientOnly>
+                    <div className="text-center mb-8">
+                        <div className="inline-flex items-center mb-4">
+                            <span className="text-primary mr-2 text-2xl">
+                                {icons.FiTerminal ? <icons.FiTerminal size={24} /> : "🖥️"}
+                            </span>
+                            <h2 className="text-3xl md:text-4xl font-bold">
+                                <span className="text-primary">Surveillance</span> Réseau
+                            </h2>
+                        </div>
+                        <p className="text-xl text-gray-300 max-w-2xl mx-auto">
+                            Surveillance en temps réel des communications avec api2.cursor.sh
+                        </p>
+                    </div>
+
+                    <div className="console-container bg-black/50 p-6 rounded-lg font-mono">
+                        <div className="console-output h-96 overflow-y-auto bg-dark/90 p-4 rounded">
+                            {logs.map((log, index) => (
+                                <div key={index} className="text-green-400 text-sm mb-2">
+                                    {log}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </ClientOnly>
+            </div>
+        </section>
+    );
+}

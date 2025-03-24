@@ -1,0 +1,145 @@
+/**
+ * Fichier d'animations centralisées
+ * Contient toutes les animations réutilisables dans l'application
+ */
+
+/* Animation flash1 - Flash blanc rapide (0.5s) */
+@keyframes flash1 {
+    0% {
+        filter: brightness(1);
+    }
+
+    25% {
+        filter: brightness(1.25);
+    }
+
+    50% {
+        filter: brightness(1.5);
+    }
+
+    75% {
+        filter: brightness(1.75);
+    }
+
+    100% {
+        filter: brightness(1.5);
+    }
+}
+
+/* Classe pour appliquer l'animation flash1 */
+.flash1 {
+    animation: flash1 0.5s ease-in-out;
+}
+
+/* Variante qui joue l'animation une seule fois quand la classe est ajoutée */
+.flash1-once {
+    animation: flash1 0.5s ease-in-out forwards;
+
+}
+
+/* Variante qui répète l'animation en continu */
+.flash1-infinite {
+    animation: flash1 0.5s ease-in-out infinite;
+}
+
+/* Variante avec un délai avant le démarrage */
+.flash1-delayed {
+    animation: flash1 0.5s ease-in-out 0.3s;
+}
+
+/* Variante avec un délai avant le démarrage */
+.flash1-delayed1 {
+    animation: flash1 0.5s ease-in-out 0.6s;
+}
+
+/* Variante avec un délai avant le démarrage */
+.flash1-delayed2 {
+    animation: flash1 0.5s ease-in-out 0.9s;
+}
+
+/* Variante avec un délai avant le démarrage */
+.flash1-delayed3 {
+    animation: flash1 0.5s ease-in-out 1.2s;
+}
+
+/* Variante avec un délai avant le démarrage */
+.flash1-delayed4 {
+    animation: flash1 0.5s ease-in-out 1.5s;
+}
+
+/* Variante avec un temps d'animation plus court */
+.flash1-quick {
+    animation: flash1 0.3s ease-in-out;
+}
+
+/* Variante avec un temps d'animation plus long */
+.flash1-slow {
+    animation: flash1 0.8s ease-in-out;
+}
+
+/* Variante avec un temps d'animation plus long */
+.flash1-slow2 {
+    animation: flash1 1s ease-in-out;
+}
+
+@keyframes color1 {
+    0% {
+        color: #ffffffda;
+    }
+
+    50% {
+        color: #098bf5;
+    }
+
+    100% {
+        color: #ffffffda;
+    }
+}
+
+.color1 {
+    animation: color1 1s ease-in-out;
+}
+
+@keyframes color2 {
+    0% {
+        color: #fff;
+    }
+
+    50% {
+        color: #000;
+    }
+
+    100% {
+        color: #fff;
+    }
+}
+
+.color2 {
+    animation: color2 0.5s ease-in-out;
+}
+
+@keyframes loupe1 {
+    0% {
+        transform: scale(1);
+    }
+
+    25% {
+        transform: scale(1.5);
+    }
+
+    50% {
+        transform: scale(1);
+    }
+
+    75% {
+        transform: scale(1.5);
+    }
+
+    100% {
+        transform: scale(1);
+    }
+}
+
+.loupe1 {
+    animation: loupe1 1s ease-in-out;
+}

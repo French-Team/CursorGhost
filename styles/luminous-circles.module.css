@@ -1,0 +1,291 @@
+/**
+ * Styles pour le composant LuminousCircles - Version améliorée
+ */
+
+.luminousCirclesContainer {
+  position: relative;
+  overflow: visible;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  transform-style: preserve-3d;
+  perspective: 1000px;
+}
+
+/* Styles communs pour tous les cercles */
+.luminousCircle {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(8px);
+  mix-blend-mode: screen;
+  opacity: 0.85;
+  box-shadow: 0 0 15px currentColor, 0 0 40px currentColor, inset 0 0 20px rgba(255, 255, 255, 0.6);
+  transform-origin: center center;
+  transition: background-color 0.5s ease;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+/* Effet de trainée derrière les cercles */
+.luminousCircle::before {
+  content: '';
+  position: absolute;
+  top: 10%;
+  left: 10%;
+  width: 80%;
+  height: 80%;
+  border-radius: 50%;
+  background: currentColor;
+  filter: blur(15px);
+  opacity: 0.4;
+}
+
+/* Premier cercle - orbit 1 */
+.circle1 {
+  animation: orbit1 15s infinite linear, pulse 6s infinite alternate;
+  z-index: 2;
+}
+
+/* Deuxième cercle - orbit 2 */
+.circle2 {
+  animation: orbit2 18s infinite linear, pulse 7s infinite alternate;
+  z-index: 3;
+}
+
+/* Troisième cercle - orbit 3 */
+.circle3 {
+  animation: orbit3 20s infinite linear, pulse 5s infinite alternate;
+  z-index: 1;
+}
+
+/* Conteneurs de particules qui suivent chaque cercle */
+.particleContainer {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.particleContainer1 {
+  animation: orbit1 15s infinite linear;
+  opacity: 0.8;
+}
+
+.particleContainer2 {
+  animation: orbit2 18s infinite linear;
+  opacity: 0.8;
+}
+
+.particleContainer3 {
+  animation: orbit3 20s infinite linear;
+  opacity: 0.8;
+}
+
+/* Particules lumineuses individuelles */
+.luminousParticle {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(2px);
+  mix-blend-mode: screen;
+  opacity: 0;
+  animation: particleFloat infinite ease-in-out;
+  box-shadow: 0 0 5px currentColor, 0 0 10px currentColor;
+}
+
+/* Lignes de connexion entre les cercles */
+.luminousConnection {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.connection12 {
+  animation: connection12 15s infinite linear;
+  opacity: 0.3;
+}
+
+.connection23 {
+  animation: connection23 18s infinite linear;
+  opacity: 0.3;
+}
+
+.connection31 {
+  animation: connection31 20s infinite linear;
+  opacity: 0.3;
+}
+
+.luminousConnection::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1px;
+  height: 1px;
+  background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.5), transparent);
+  filter: blur(1px);
+  transform-origin: 0 0;
+  animation: connectionPulse 5s infinite alternate;
+}
+
+.connection12::before {
+  animation: connectionLine12 15s infinite linear, connectionPulse 5s infinite alternate;
+}
+
+.connection23::before {
+  animation: connectionLine23 18s infinite linear, connectionPulse 6s infinite alternate;
+}
+
+.connection31::before {
+  animation: connectionLine31 20s infinite linear, connectionPulse 7s infinite alternate;
+}
+
+/* Effet de brillance au centre */
+.luminousCenterGlow {
+  position: absolute;
+  width: 60%;
+  height: 60%;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.4) 0%, transparent 70%);
+  filter: blur(15px);
+  z-index: 0;
+  opacity: 0.7;
+  animation: centralPulse 8s infinite alternate;
+  pointer-events: none;
+}
+
+/* Animations d'orbites pour les cercles */
+@keyframes orbit1 {
+  0% { transform: translate(calc(-50% + 0px), calc(-50% - 70px)) scale(1) rotate(0deg); }
+  25% { transform: translate(calc(-50% + 70px), calc(-50% - 20px)) scale(0.9) rotate(90deg); }
+  50% { transform: translate(calc(-50% + 0px), calc(-50% + 70px)) scale(1) rotate(180deg); }
+  75% { transform: translate(calc(-50% - 70px), calc(-50% - 20px)) scale(1.1) rotate(270deg); }
+  100% { transform: translate(calc(-50% + 0px), calc(-50% - 70px)) scale(1) rotate(360deg); }
+}
+
+@keyframes orbit2 {
+  0% { transform: translate(calc(-50% - 60px), calc(-50% + 40px)) scale(1) rotate(0deg); }
+  25% { transform: translate(calc(-50% - 20px), calc(-50% - 60px)) scale(1.1) rotate(-90deg); }
+  50% { transform: translate(calc(-50% + 60px), calc(-50% + 20px)) scale(1) rotate(-180deg); }
+  75% { transform: translate(calc(-50% + 20px), calc(-50% + 70px)) scale(0.9) rotate(-270deg); }
+  100% { transform: translate(calc(-50% - 60px), calc(-50% + 40px)) scale(1) rotate(-360deg); }
+}
+
+@keyframes orbit3 {
+  0% { transform: translate(calc(-50% + 50px), calc(-50% + 50px)) scale(1.1) rotate(0deg); }
+  33% { transform: translate(calc(-50% - 60px), calc(-50% + 0px)) scale(0.9) rotate(120deg); }
+  66% { transform: translate(calc(-50% + 20px), calc(-50% - 60px)) scale(1) rotate(240deg); }
+  100% { transform: translate(calc(-50% + 50px), calc(-50% + 50px)) scale(1.1) rotate(360deg); }
+}
+
+/* Animation pour les connexions entre les cercles */
+@keyframes connectionPulse {
+  0% { 
+    width: 1px;
+    opacity: 0.2;
+  }
+  100% { 
+    width: 2px;
+    opacity: 0.5;
+  }
+}
+
+@keyframes connectionLine12 {
+  0% { transform: rotate(0deg) scale(40, 1); }
+  100% { transform: rotate(360deg) scale(40, 1); }
+}
+
+@keyframes connectionLine23 {
+  0% { transform: rotate(120deg) scale(40, 1); }
+  100% { transform: rotate(480deg) scale(40, 1); }
+}
+
+@keyframes connectionLine31 {
+  0% { transform: rotate(240deg) scale(40, 1); }
+  100% { transform: rotate(600deg) scale(40, 1); }
+}
+
+/* Animation de float pour les particules */
+@keyframes particleFloat {
+  0% {
+    transform: translate(0, 0) scale(0.5);
+    opacity: 0;
+  }
+  20% {
+    opacity: 0.8;
+  }
+  80% {
+    opacity: 0.6;
+  }
+  100% {
+    transform: translate(var(--tx, 20px), var(--ty, -20px)) scale(1);
+    opacity: 0;
+  }
+}
+
+/* Animation de pulsation pour les cercles */
+@keyframes pulse {
+  0% {
+    filter: blur(8px);
+    box-shadow: 0 0 15px currentColor, 0 0 40px currentColor, inset 0 0 20px rgba(255, 255, 255, 0.6);
+  }
+  50% {
+    filter: blur(10px);
+    box-shadow: 0 0 20px currentColor, 0 0 50px currentColor, inset 0 0 25px rgba(255, 255, 255, 0.7);
+  }
+  100% {
+    filter: blur(12px);
+    box-shadow: 0 0 25px currentColor, 0 0 60px currentColor, inset 0 0 30px rgba(255, 255, 255, 0.8);
+  }
+}
+
+/* Animation de pulsation pour la lueur centrale */
+@keyframes centralPulse {
+  0% {
+    opacity: 0.5;
+    transform: translate(-50%, -50%) scale(0.8);
+    filter: blur(15px);
+  }
+  100% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(1.2);
+    filter: blur(20px);
+  }
+}
+
+/* Media query pour les écrans plus petits */
+@media (max-width: 768px) {
+  .luminousCircle {
+    filter: blur(6px);
+  }
+  
+  @keyframes orbit1 {
+    0% { transform: translate(calc(-50% + 0px), calc(-50% - 50px)) scale(1) rotate(0deg); }
+    25% { transform: translate(calc(-50% + 50px), calc(-50% - 15px)) scale(0.9) rotate(90deg); }
+    50% { transform: translate(calc(-50% + 0px), calc(-50% + 50px)) scale(1) rotate(180deg); }
+    75% { transform: translate(calc(-50% - 50px), calc(-50% - 15px)) scale(1.1) rotate(270deg); }
+    100% { transform: translate(calc(-50% + 0px), calc(-50% - 50px)) scale(1) rotate(360deg); }
+  }
+  
+  @keyframes orbit2 {
+    0% { transform: translate(calc(-50% - 40px), calc(-50% + 30px)) scale(1) rotate(0deg); }
+    25% { transform: translate(calc(-50% - 15px), calc(-50% - 40px)) scale(1.1) rotate(-90deg); }
+    50% { transform: translate(calc(-50% + 40px), calc(-50% + 15px)) scale(1) rotate(-180deg); }
+    75% { transform: translate(calc(-50% + 15px), calc(-50% + 50px)) scale(0.9) rotate(-270deg); }
+    100% { transform: translate(calc(-50% - 40px), calc(-50% + 30px)) scale(1) rotate(-360deg); }
+  }
+  
+  @keyframes orbit3 {
+    0% { transform: translate(calc(-50% + 35px), calc(-50% + 35px)) scale(1.1) rotate(0deg); }
+    33% { transform: translate(calc(-50% - 45px), calc(-50% + 0px)) scale(0.9) rotate(120deg); }
+    66% { transform: translate(calc(-50% + 15px), calc(-50% - 45px)) scale(1) rotate(240deg); }
+    100% { transform: translate(calc(-50% + 35px), calc(-50% + 35px)) scale(1.1) rotate(360deg); }
+  }
+} 
